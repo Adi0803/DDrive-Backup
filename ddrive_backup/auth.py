@@ -11,6 +11,8 @@ from typing import Callable
 
 import msal
 from msal_extensions import FilePersistence, PersistedTokenCache, build_encrypted_persistence
+from msal_extensions.filelock import LockError
+from msal_extensions.persistence import PersistenceError
 
 log = logging.getLogger(__name__)
 
@@ -32,12 +34,28 @@ def _persistence(path: Path):
         return FilePersistence(str(path))
 
 
+def remove_stale_cache_lock(cache_path: Path) -> None:
+    """msal-extensions guards the cache with a "<cache>.lockfile". If a previous
+    run was killed while saving, that file stays behind and blocks every later
+    sign-in. Call this only while holding the backup's own single-instance lock."""
+    lockfile = Path(str(cache_path) + ".lockfile")
+    if lockfile.exists():
+        try:
+            lockfile.unlink()
+            log.info("Removed a leftover sign-in lock file (%s).", lockfile.name)
+        except OSError as exc:
+            log.warning("Could not remove leftover %s: %s", lockfile.name, exc)
+
+
 class TokenProvider:
     """Hands out Microsoft Graph access tokens and renews them as needed.
 
     `interactive` decides what happens when the saved sign-in no longer works:
     True  -> show a sign-in code in the console and wait for the user;
     False -> raise SignInRequired so the caller can stop cleanly.
+
+    Network errors (requests exceptions) are passed on to the caller, which
+    knows how to wait for the network.
     """
 
     def __init__(self, client_id: str, tenant_id: str, cache_path: Path,
@@ -45,23 +63,49 @@ class TokenProvider:
         self._lock = threading.Lock()
         self._show = show
         self.interactive = interactive
-        self._app = msal.PublicClientApplication(
-            client_id,
-            authority=f"https://login.microsoftonline.com/{tenant_id}",
-            token_cache=PersistedTokenCache(_persistence(cache_path)),
-        )
+        self._client_id, self._tenant_id = client_id, tenant_id
+        self._cache_path = cache_path
+        self._app: msal.PublicClientApplication | None = None
         self._token: str | None = None
         self._expires_at = 0.0
+
+    def _application(self) -> msal.PublicClientApplication:
+        # Created on first use: MSAL contacts the sign-in server when it starts.
+        if self._app is None:
+            self._app = msal.PublicClientApplication(
+                self._client_id,
+                authority=f"https://login.microsoftonline.com/{self._tenant_id}",
+                token_cache=PersistedTokenCache(_persistence(self._cache_path)),
+            )
+        return self._app
+
+    def _reset_broken_cache(self, exc: Exception) -> None:
+        log.warning("The saved sign-in could not be used (%s); a new sign-in is needed.", exc)
+        remove_stale_cache_lock(self._cache_path)
+        if self._cache_path.exists():
+            try:
+                os.replace(self._cache_path, self._cache_path.with_name(self._cache_path.stem + ".broken.bin"))
+            except OSError as move_exc:
+                log.warning("Could not move the broken sign-in file aside: %s", move_exc)
+        self._app = None
 
     def get(self, force_refresh: bool = False) -> str:
         with self._lock:
             if not force_refresh and self._token and time.time() < self._expires_at - 300:
                 return self._token
             result = None
-            accounts = self._app.get_accounts()
-            if accounts:
-                result = self._app.acquire_token_silent_with_error(
-                    SCOPES, account=accounts[0], force_refresh=force_refresh)
+            for attempt in (1, 2):
+                try:
+                    app = self._application()
+                    accounts = app.get_accounts()
+                    if accounts:
+                        result = app.acquire_token_silent_with_error(
+                            SCOPES, account=accounts[0], force_refresh=force_refresh)
+                    break
+                except (PersistenceError, LockError) as exc:
+                    if attempt == 2:
+                        raise SignInRequired(f"The saved sign-in is damaged ({exc}).") from exc
+                    self._reset_broken_cache(exc)
             if not result or "access_token" not in result:
                 reason = _describe(result) if result else "no saved sign-in"
                 if not self.interactive:
@@ -73,7 +117,8 @@ class TokenProvider:
             return self._token
 
     def _device_flow(self) -> dict:
-        flow = self._app.initiate_device_flow(scopes=SCOPES)
+        app = self._application()
+        flow = app.initiate_device_flow(scopes=SCOPES)
         if "user_code" not in flow:
             raise SignInRequired(f"Could not start Microsoft sign-in: {_describe(flow)}")
         url = flow.get("verification_uri", "https://microsoft.com/devicelogin")
@@ -85,7 +130,7 @@ class TokenProvider:
             f"  2. Enter code  {flow['user_code']}\n"
             "  3. Sign in with your work account.\n\n"
             "The backup continues automatically after you sign in.\n" + "=" * 70 + "\n")
-        result = self._app.acquire_token_by_device_flow(flow)
+        result = app.acquire_token_by_device_flow(flow)
         if "access_token" not in result:
             raise SignInRequired(f"Microsoft sign-in did not complete: {_describe(result)}")
         log.info("Microsoft sign-in successful.")

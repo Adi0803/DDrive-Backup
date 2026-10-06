@@ -57,7 +57,7 @@ def scan_local(root: str, remote_prefix_len: int, progress: Callable[[int], None
                 entries = sorted(it, key=lambda e: e.name.casefold())
         except OSError as exc:
             result.unreadable[(rel_dir or ".") + "/"] = "folder could not be read: " + describe_os_error(
-                local_path(root, rel_dir), exc)
+                local_path(base, rel_dir), exc)
             continue
         subdirs = []
         for entry in entries:
@@ -70,21 +70,26 @@ def scan_local(root: str, remote_prefix_len: int, progress: Callable[[int], None
                 problem = onedrive_name_problem(entry.name)
                 if problem is None and remote_prefix_len + 1 + len(rel) > MAX_PATH_CHARS:
                     problem = f"the path is longer than OneDrive's {MAX_PATH_CHARS}-character limit"
+                key = key_for(rel)
+                if problem is None and (key in result.files or key in result.folders):
+                    other = result.files[key].path if key in result.files else result.folders[key]
+                    problem = (f"same name as \"{other}\" apart from upper/lower case or accents; "
+                               "OneDrive can keep only one of them")
                 if problem:
                     result.not_allowed[rel + ("/" if is_dir else "")] = problem
                     continue
                 if is_dir:
-                    result.folders[key_for(rel)] = rel
+                    result.folders[key] = rel
                     subdirs.append(rel)
                 elif entry.is_file(follow_symlinks=False):
                     st = entry.stat(follow_symlinks=False)
                     birth = getattr(st, "st_birthtime_ns", None) or st.st_ctime_ns
-                    result.files[key_for(rel)] = LocalFile(rel, st.st_size, st.st_mtime_ns, birth)
+                    result.files[key] = LocalFile(rel, st.st_size, st.st_mtime_ns, birth)
                     result.total_bytes += st.st_size
                     if progress and len(result.files) % 500 == 0:
                         progress(len(result.files))
             except OSError as exc:
-                result.unreadable[rel] = describe_os_error(local_path(root, rel), exc)
+                result.unreadable[rel] = describe_os_error(local_path(base, rel), exc)
         stack.extend(reversed(subdirs))
     if progress:
         progress(len(result.files))

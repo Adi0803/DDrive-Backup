@@ -77,8 +77,10 @@ def _open_error_code(path: str) -> int:
 
 
 class KeepAwake:
-    """Stop Windows from going to sleep because of inactivity while uploading.
-    (It cannot stop sleep caused by closing the lid or pressing the power button.)"""
+    """Ask Windows not to sleep because of inactivity while the backup runs.
+    It cannot prevent sleep from closing the lid or the power button, and on
+    battery many laptops ("Modern Standby") still sleep a few minutes after the
+    screen turns off; uploads then resume on the next run."""
 
     ES_CONTINUOUS = 0x80000000
     ES_SYSTEM_REQUIRED = 0x00000001
@@ -114,7 +116,42 @@ def enable_ansi_console() -> bool:
         if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
             return False
         ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-        return bool(kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+        ok = bool(kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+        _disable_quick_edit(kernel32)
+        return ok
+    except Exception:
+        return False
+
+
+def _disable_quick_edit(kernel32) -> None:
+    """In the classic console a mouse click starts a text selection, which
+    pauses all output - and with it the backup - until a key is pressed."""
+    import ctypes
+    from ctypes import wintypes
+
+    handle = kernel32.GetStdHandle(-10)              # STD_INPUT_HANDLE
+    mode = wintypes.DWORD()
+    if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        ENABLE_QUICK_EDIT_MODE, ENABLE_EXTENDED_FLAGS = 0x0040, 0x0080
+        kernel32.SetConsoleMode(handle, (mode.value | ENABLE_EXTENDED_FLAGS) & ~ENABLE_QUICK_EDIT_MODE)
+
+
+def on_battery() -> bool:
+    """True when a laptop is running on battery (False if unknown)."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+
+        class SYSTEM_POWER_STATUS(ctypes.Structure):
+            _fields_ = [("ACLineStatus", ctypes.c_ubyte), ("BatteryFlag", ctypes.c_ubyte),
+                        ("BatteryLifePercent", ctypes.c_ubyte), ("SystemStatusFlag", ctypes.c_ubyte),
+                        ("BatteryLifeTime", ctypes.c_ulong), ("BatteryFullLifeTime", ctypes.c_ulong)]
+
+        status = SYSTEM_POWER_STATUS()
+        if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)):
+            return False
+        return status.ACLineStatus == 0
     except Exception:
         return False
 
@@ -219,17 +256,25 @@ def open_in_new_window(args: list[str], cwd: str) -> None:
                      close_fds=True)
 
 
-def wait_or_keypress(seconds: int) -> None:
-    """Wait up to `seconds`, returning early if a key is pressed in the console."""
+def wait_or_keypress(seconds: int | None) -> None:
+    """Wait up to `seconds` (None = until a key is pressed), returning early if a
+    key is pressed in the console. Keys pressed earlier during the run are ignored."""
     import time
 
-    end = time.monotonic() + seconds
+    end = None if seconds is None else time.monotonic() + seconds
     if IS_WINDOWS:
         import msvcrt
-        while time.monotonic() < end:
+        while msvcrt.kbhit():           # forget keys typed while the backup was running
+            msvcrt.getwch()
+        while end is None or time.monotonic() < end:
             if msvcrt.kbhit():
                 msvcrt.getwch()
                 return
             time.sleep(0.1)
+    elif seconds is None:
+        try:
+            input()
+        except (EOFError, OSError):
+            pass
     else:
         time.sleep(max(0, seconds))

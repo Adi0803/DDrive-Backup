@@ -30,7 +30,8 @@ class State:
     @staticmethod
     def _fresh() -> dict:
         return {"version": STATE_VERSION, "drive_id": None, "root_id": None,
-                "first_complete_backup": None, "files": {}, "sessions": {}, "failures": {}}
+                "first_complete_backup": None, "files": {}, "sessions": {}, "failures": {},
+                "other_failures": {}}
 
     def load(self) -> None:
         if not self.path.exists():
@@ -88,6 +89,10 @@ class State:
                 del self.data["failures"][k]
             for k in [k for k in self.data["sessions"] if k not in keep_keys]:
                 del self.data["sessions"][k]
+            week_ago = time.time() - 7 * 24 * 3600
+            others = self.data["other_failures"]
+            for k in [k for k, v in others.items() if v.get("at", 0) < week_ago]:
+                del others[k]
             self._dirty = True
 
     # --- unfinished large uploads --------------------------------------------
@@ -108,17 +113,39 @@ class State:
             self._dirty = True
         self.save_soon()
 
-    # --- files that failed (so the 10-minute check does not pop up for them) ---
+    # --- things that failed (so the 10-minute check does not pop up for them) ---
 
-    def set_failure(self, key: str, size: int, mtime_ns: int, reason: str) -> None:
+    def set_failure(self, key: str, size: int, mtime_ns: int, reason: str, kind: str = "upload") -> None:
+        """kind "unreadable": the local file could not be read (e.g. blocked by
+        antivirus); it stays quiet until the file itself changes."""
         with self._lock:
-            self.data["failures"][key] = {"size": size, "mtime_ns": mtime_ns, "reason": reason, "at": time.time()}
+            self.data["failures"][key] = {"size": size, "mtime_ns": mtime_ns, "reason": reason,
+                                          "kind": kind, "at": time.time()}
             self._dirty = True
 
     def recent_failure(self, key: str, size: int, mtime_ns: int, within_seconds: float) -> bool:
         with self._lock:
             f = self.data["failures"].get(key)
-        return bool(f and f["size"] == size and f["mtime_ns"] == mtime_ns and f["at"] > time.time() - within_seconds)
+        if not f or f["size"] != size or f["mtime_ns"] != mtime_ns:
+            return False
+        return f.get("kind") == "unreadable" or f["at"] > time.time() - within_seconds
+
+    def set_other_failure(self, tag: str, reason: str) -> None:
+        """Failures that are not about one local file: a folder that could not be
+        created ("folder:<key>") or an item that could not be deleted ("delete:<id>")."""
+        with self._lock:
+            self.data["other_failures"][tag] = {"reason": reason, "at": time.time()}
+            self._dirty = True
+
+    def recent_other_failure(self, tag: str, within_seconds: float) -> bool:
+        with self._lock:
+            f = self.data["other_failures"].get(tag)
+        return bool(f and f["at"] > time.time() - within_seconds)
+
+    def clear_other_failure(self, tag: str) -> None:
+        with self._lock:
+            if self.data["other_failures"].pop(tag, None) is not None:
+                self._dirty = True
 
     # --- run-level facts ------------------------------------------------------
 

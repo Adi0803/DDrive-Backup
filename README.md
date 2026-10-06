@@ -5,16 +5,27 @@ Microsoft Graph. It doesn't need the OneDrive app or a second copy of your data 
 
 - **Every 10 minutes** a hidden check looks for the office Wi-Fi ("Horizon 5G"). If something
   changed, a window opens and shows the progress. If nothing changed, you see nothing.
+- **The window closes by itself** 30 seconds after a backup that went fine. If something needs
+  your attention (files that could not be read, the safety stop, a sign-in), it stays open until
+  you press a key.
+- **Lasting problems are shown, not hidden.** For example, the backup folder is missing or Windows
+  won't reveal the Wi-Fi name. If such a problem is still there after 30 minutes, the window
+  opens once to show it, then at most once a day.
 - **Only new or changed files are uploaded.** The script keeps a record of what it uploaded. Files
   with no record are compared against OneDrive's fingerprint of each file (QuickXorHash), so
   nothing is uploaded twice.
 - **Every upload is checked.** After each upload, OneDrive's fingerprint must match the local
   file, otherwise the file counts as failed and is retried.
 - **One bad file never stops the backup.** Files that can't be read (locked, blocked by antivirus)
-  are skipped and listed at the end.
+  are skipped and listed at the end. Such a file doesn't reopen the window again until it changes.
 - **Exact mirror after the first complete backup.** Files you delete in `D:\OneDrive Backup` are
-  deleted from OneDrive too, into OneDrive's recycle bin. Safety stop: if one run would delete
-  more than 10% of the backup, it deletes nothing and tells you how to approve it.
+  deleted from OneDrive too, into OneDrive's recycle bin.
+  - Before that happens, the dry run and the first backup tell you how many files are in OneDrive
+    but no longer on D:.
+  - Safety stop: if one run would delete more than 10% of the backup, counted in files or in GB,
+    it deletes nothing and shows the exact command to approve it.
+  - If a moved or renamed file can't be uploaded at its new place, its old copy stays in OneDrive
+    until the new one is uploaded.
 
 ## Install / update (on the laptop that does the backup)
 
@@ -54,9 +65,11 @@ and Entra app registration stay as they are, and no new Python packages are need
 
 ## Commands
 
+Run these in cmd from the program folder (`cd /d C:\DDriveOneDriveBackup`):
+
 | Command | What it does |
 |---|---|
-| `python DDriveOneDriveBackup.py` | Back up now (only on the office Wi-Fi) |
+| `.venv\Scripts\python.exe DDriveOneDriveBackup.py` | Back up now (only on the office Wi-Fi) |
 | `... --dry-run` | Show what would happen; change nothing |
 | `... --approve-deletions` | Allow this run to delete more than the safety limit from OneDrive |
 | `... --any-network` | Run even when not on the office Wi-Fi |
@@ -77,7 +90,7 @@ See `config.example.json`. Your existing file works as it is. New settings are o
 | `mirror_safety_limit_percent` | 10 | Never delete more than this share of the backup in one run without approval |
 | `parallel_uploads` | 4 | Files uploaded at the same time (1–8) |
 | `window_close_seconds` | 30 | How long the pop-up window stays open after a run |
-| `dry_run` | false | Same as `--dry-run` |
+| `dry_run` | false | Same as `--dry-run`. While it is `true`, the background check does nothing |
 
 `delete_remote_files` from the old version is no longer used.
 
@@ -88,7 +101,8 @@ See `config.example.json`. Your existing file works as it is. New settings are o
   it by comparing fingerprints, which is slower once but safe.
 - `auth_cache_dpapi.bin`: your saved Microsoft sign-in, encrypted for your Windows user. Never
   share it.
-- `backup.lock`: makes sure only one backup runs at a time.
+- `backup.lock`, `window.lock`: make sure only one backup and one window run at a time.
+- `check_problem.json`: remembers a lasting problem the background check found, so it can show it.
 
 ## Troubleshooting
 
@@ -100,6 +114,9 @@ See `config.example.json`. Your existing file works as it is. New settings are o
   protection > Protection history.
 - **"NOT deleting N files from OneDrive"**: more than 10% of the backup would be deleted. If you
   really removed those files, run with `--approve-deletions` once.
+- **On battery the laptop went to sleep mid-backup**: many laptops still sleep a few minutes after
+  the screen turns off on battery, whatever a program asks. The backup continues on the next run.
+  Large uploads resume where they stopped. Plug in for big first uploads.
 - **The ETA says "estimating…"**: the script only shows a finish time once its speed
   measurements support it. For example, after many small files it can't yet know how long a
   2 GB file will take.

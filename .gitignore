@@ -10,6 +10,8 @@ backup_state.json
 backup_state.tmp
 backup_state.broken.json
 backup.lock
+window.lock
+check_problem.json
 
 # Python
 .venv/

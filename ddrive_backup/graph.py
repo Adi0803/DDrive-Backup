@@ -74,6 +74,15 @@ class _SessionGone(Exception):
     pass
 
 
+def error_for(resp: requests.Response) -> Exception:
+    """The exception for a failed OneDrive answer. A full OneDrive stops the whole
+    run (every other file would fail the same way)."""
+    error = GraphError.from_response(resp)
+    if resp.status_code == 507 or error.code in ("quotaLimitReached", "insufficientStorage"):
+        return FatalRunError("Your OneDrive is full (no storage left). " + error.message)
+    return error
+
+
 class Stopper:
     """Shared stop signal for all threads."""
 
@@ -167,14 +176,17 @@ class GraphClient:
         `data` must be bytes so a retry can send exactly the same body again."""
         if not url.startswith(("http://", "https://")):
             url = GRAPH_ROOT + url
-        attempt, network_waited, refreshed = 0, 0.0, False
+        attempt, network_waited, refreshed, force_refresh = 0, 0.0, False, False
         while True:
             self.stopper.check()
             attempt += 1
             hdrs = dict(headers or {})
-            if auth:
-                hdrs["Authorization"] = "Bearer " + self.tokens.get()
             try:
+                # Getting a token can need the network too (sign-in server), so it
+                # goes through the same connection-problem handling.
+                if auth:
+                    hdrs["Authorization"] = "Bearer " + self.tokens.get(force_refresh=force_refresh)
+                    force_refresh = False
                 resp = self._session().request(method, url, json=json_body, data=data,
                                                headers=hdrs, timeout=timeout)
             except requests.RequestException as exc:
@@ -182,8 +194,7 @@ class GraphClient:
                 continue
             network_waited = 0.0
             if resp.status_code == 401 and auth and not refreshed:
-                refreshed = True
-                self.tokens.get(force_refresh=True)
+                refreshed = force_refresh = True
                 continue
             if resp.status_code in RETRYABLE_STATUS and attempt < MAX_HTTP_ATTEMPTS:
                 delay = _retry_after_seconds(resp) or _backoff(attempt)
@@ -193,10 +204,7 @@ class GraphClient:
                 continue
             if resp.status_code in ok:
                 return resp
-            error = GraphError.from_response(resp)
-            if resp.status_code == 507 or error.code in ("quotaLimitReached", "insufficientStorage"):
-                raise FatalRunError("Your OneDrive is full (no storage left). " + error.message)
-            raise error
+            raise error_for(resp)
 
     def wait_for_network(self, exc: Exception, waited: float, attempt: int) -> float:
         """Called after a connection problem. Stops the run if we left the office
@@ -427,7 +435,7 @@ class _FragmentUpload:
                 log.info("Upload session for %s expired; starting it again.", self.path)
                 upload_url = None
                 self._report(0)
-            except (FileFailed, GraphError):
+            except (FileFailed, GraphError, FatalRunError):
                 self._cancel(upload_url)
                 if remember_session:
                     remember_session(None)
@@ -443,7 +451,10 @@ class _FragmentUpload:
             fetched = self.client.request(
                 "GET", f"/drives/{self.client.drive_id}/items/{item['id']}?$select=id,size,file").json()
             remote_hash = ((fetched.get("file") or {}).get("hashes") or {}).get("quickXorHash")
-        if remote_hash and remote_hash != local_hash:
+        if not remote_hash:
+            log.warning("OneDrive has no checksum for %s yet; the size matches and the checksum "
+                        "will be compared on a later run.", self.path)
+        elif remote_hash != local_hash:
             raise FileFailed("The copy in OneDrive does not match the local file (checksum differs).")
         return item, local_hash
 
@@ -509,7 +520,7 @@ class _FragmentUpload:
                 if isinstance(offset, dict):
                     return offset
                 continue
-            raise GraphError.from_response(resp)
+            raise error_for(resp)
 
     def _resync(self, upload_url: str, parent_id: str, name: str):
         """Ask OneDrive where to continue. Returns an offset, a finished driveItem
