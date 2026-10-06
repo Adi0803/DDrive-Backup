@@ -269,7 +269,7 @@ class TransferProgress:
         eta_text = ""
         if show_eta:
             if done_f >= self.total_files:
-                eta_text = "   Finishing..."
+                eta_text = "   Done"
             else:
                 eta = self.eta.estimate(now, self.total_bytes - done_b, self.total_files - done_f)
                 eta_text = f"   ETA ~{fmt_duration(eta)}" if eta is not None else "   ETA: estimating..."
