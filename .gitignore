@@ -1,0 +1,18 @@
+# Personal settings and sign-in data: never commit these
+config.json
+auth_cache*.bin
+auth_cache*.lockfile
+*.lockfile
+
+# Created while running
+backup.log*
+backup_state.json
+backup_state.tmp
+backup_state.broken.json
+backup.lock
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

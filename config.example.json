@@ -1,0 +1,17 @@
+{
+    "client_id": "PASTE-YOUR-APPLICATION-CLIENT-ID",
+    "tenant_id": "PASTE-YOUR-DIRECTORY-TENANT-ID",
+
+    "source_folder": "D:\\OneDrive Backup",
+    "onedrive_folder": "D-Drive-Backup",
+
+    "office_wifi_ssid": "Horizon 5G",
+    "scan_interval_minutes": 10,
+
+    "mirror_deletions": "auto",
+    "mirror_safety_limit_percent": 10,
+
+    "parallel_uploads": 4,
+    "window_close_seconds": 30,
+    "dry_run": false
+}
