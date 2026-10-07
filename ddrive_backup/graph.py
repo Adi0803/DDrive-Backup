@@ -28,6 +28,7 @@ FRAGMENT_SIZE = 32 * 320 * 1024          # 10 MiB; fragments must be multiples o
 LARGE_FILE_SIZE = 4 * FRAGMENT_SIZE      # 40 MiB: 'large' for scheduling; their upload sessions are remembered
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 MAX_HTTP_ATTEMPTS = 8
+MAX_THROTTLE_SECONDS = 1800              # wait at most this long in total when OneDrive asks us to slow down
 NETWORK_PATIENCE_SECONDS = 600           # keep retrying a dead connection this long
 TIMEOUT = (30, 120)                      # (connect, read) seconds for normal calls
 FRAGMENT_TIMEOUT = (30, 300)
@@ -156,6 +157,15 @@ class GraphClient:
         self.network_problem = network_problem
         self.drive_id = ""
         self._local = threading.local()
+        self._pause_until = 0.0              # OneDrive asked all requests to wait until then
+        self._pause_lock = threading.Lock()
+
+    def throttled(self) -> bool:
+        return time.monotonic() < self._pause_until
+
+    def _pause_all(self, seconds: float) -> None:
+        with self._pause_lock:
+            self._pause_until = max(self._pause_until, time.monotonic() + seconds)
 
     # --- plumbing -----------------------------------------------------------
 
@@ -177,8 +187,12 @@ class GraphClient:
         if not url.startswith(("http://", "https://")):
             url = GRAPH_ROOT + url
         attempt, network_waited, refreshed, force_refresh = 0, 0.0, False, False
+        throttled_for = 0.0
         while True:
             self.stopper.check()
+            wait_for = self._pause_until - time.monotonic()
+            if wait_for > 0:                     # another request was told to slow down
+                self.stopper.sleep(wait_for)
             attempt += 1
             hdrs = dict(headers or {})
             try:
@@ -196,12 +210,25 @@ class GraphClient:
             if resp.status_code == 401 and auth and not refreshed:
                 refreshed = force_refresh = True
                 continue
-            if resp.status_code in RETRYABLE_STATUS and attempt < MAX_HTTP_ATTEMPTS:
-                delay = _retry_after_seconds(resp) or _backoff(attempt)
-                log.warning("OneDrive answered HTTP %s for %s %s; retrying in %.0f s.",
-                            resp.status_code, method, _short(url), delay)
-                self.stopper.sleep(delay)
-                continue
+            if resp.status_code in RETRYABLE_STATUS:
+                retry_after = _retry_after_seconds(resp)
+                if (resp.status_code == 429 or retry_after) and throttled_for < MAX_THROTTLE_SECONDS:
+                    # Normal throttling: OneDrive limits how many requests an app may
+                    # make per minute. Everyone waits as asked, then carries on; this
+                    # does not count as a failed attempt.
+                    delay = retry_after or _backoff(min(attempt, 5))
+                    throttled_for += delay
+                    attempt -= 1
+                    self._pause_all(delay)
+                    log.info("OneDrive asked us to slow down (HTTP %s); waiting %.0f s.", resp.status_code, delay)
+                    self.stopper.sleep(delay)
+                    continue
+                if attempt < MAX_HTTP_ATTEMPTS:
+                    delay = retry_after or _backoff(attempt)
+                    log.warning("OneDrive answered HTTP %s for %s %s; retrying in %.0f s.",
+                                resp.status_code, method, _short(url), delay)
+                    self.stopper.sleep(delay)
+                    continue
             if resp.status_code in ok:
                 return resp
             raise error_for(resp)
@@ -282,7 +309,7 @@ class GraphClient:
         return items
 
     def list_tree(self, root_id: str, progress: Callable[[int, int], None] | None = None,
-                  workers: int = 8) -> tuple[dict[str, RemoteFolder], dict[str, RemoteFile]]:
+                  workers: int = 4) -> tuple[dict[str, RemoteFolder], dict[str, RemoteFile]]:
         """Everything below the backup folder, keyed by normalised relative path."""
         folders: dict[str, RemoteFolder] = {"": RemoteFolder(root_id, "")}
         files: dict[str, RemoteFile] = {}

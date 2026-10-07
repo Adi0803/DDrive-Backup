@@ -3,8 +3,17 @@
 Backs up `D:\OneDrive Backup` to your work OneDrive (folder `D-Drive-Backup`) through
 Microsoft Graph. It doesn't need the OneDrive app or a second copy of your data on the laptop.
 
-- **Every 10 minutes** a hidden check looks for the office Wi-Fi ("Horizon 5G"). If something
-  changed, a window opens and shows the progress. If nothing changed, you see nothing.
+- **It starts by itself.** A hidden check runs about 1 minute after you sign in to Windows,
+  30 seconds after the PC connects to a network, and every 10 minutes. You never start it
+  yourself, and it stays on after restarts.
+- **It pauses for 4 hours after each backup.** The finish time of the last backup is saved, so
+  the pause survives restarts and power-offs. During the pause the check does nothing at all.
+  To back up anyway, double-click **`Back up now.bat`**, which ignores the pause and the timer.
+- **It backs up only on the office Wi-Fi ("Horizon 5G").** If something changed, a window opens
+  and shows the progress. If nothing changed, you see nothing.
+- **The check is quick and quiet.** It compares `D:\OneDrive Backup` with the record of the last
+  backup and makes no OneDrive requests. OneDrive itself is checked fully in every real backup,
+  and by the check once a day, to catch files changed or deleted directly in OneDrive.
 - **The window closes by itself** 30 seconds after a backup that went fine. If something needs
   your attention (files that could not be read, the safety stop, a sign-in), it stays open until
   you press a key.
@@ -33,8 +42,13 @@ Everything goes into the existing `C:\DDriveOneDriveBackup` folder. Your `.venv`
 and Entra app registration stay as they are, and no new Python packages are needed.
 
 1. Download this repository: on GitHub, choose the branch, then **Code > Download ZIP**.
-2. Copy `DDriveOneDriveBackup.py` and the whole `ddrive_backup` folder into
-   `C:\DDriveOneDriveBackup`, replacing the old `DDriveOneDriveBackup.py`.
+   Before unzipping, right-click the ZIP > **Properties** > tick **Unblock** > **OK**. Otherwise
+   Windows shows a security warning when you double-click the `.bat` files. The program also
+   removes that warning from its `.bat` files the first time it runs.
+2. Copy into `C:\DDriveOneDriveBackup`, replacing what's there:
+   - `DDriveOneDriveBackup.py`
+   - the whole `ddrive_backup` folder (the program's code)
+   - the three `.bat` files: `Install autostart.bat`, `Remove autostart.bat` and `Back up now.bat`
 3. Recommended, because the old sign-in file was not encrypted and was shared in a zip: open
    <https://mysignins.microsoft.com/security-info> and choose **Sign out everywhere**. The new
    script deletes the old `auth_cache.bin` anyway. You'll sign in once more, and the new sign-in
@@ -55,13 +69,12 @@ and Entra app registration stay as they are, and no new Python packages are need
 
    The first run compares the files already in OneDrive with the local ones. This reads them
    from D: once and uploads only what is missing or different.
-6. Turn on the 10-minute background check:
-
-   ```
-   .venv\Scripts\python.exe DDriveOneDriveBackup.py --install-schedule
-   ```
-
-   To turn it off again: `.venv\Scripts\python.exe DDriveOneDriveBackup.py --remove-schedule`
+6. Turn on autostart: double-click **`Install autostart.bat`**. This is needed only once; it
+   stays on after restarts.
+   - Double-click it normally, while signed in as yourself. Don't use "Run as administrator" with
+     another account, because the task would then belong to that account.
+   - To turn autostart off again, double-click **`Remove autostart.bat`**.
+   - To run a backup right away by hand, double-click **`Back up now.bat`**.
 
 ## Commands
 
@@ -73,7 +86,7 @@ Run these in cmd from the program folder (`cd /d C:\DDriveOneDriveBackup`):
 | `... --dry-run` | Show what would happen; change nothing |
 | `... --approve-deletions` | Allow this run to delete more than the safety limit from OneDrive |
 | `... --any-network` | Run even when not on the office Wi-Fi |
-| `... --install-schedule` / `--remove-schedule` | Turn the 10-minute background check on or off |
+| `... --install-schedule` / `--remove-schedule` | Turn autostart on or off (same as the `.bat` files) |
 
 Exit codes: 0 = OK, 1 = finished but some files had problems, 2 = config error,
 3 = not on the office Wi-Fi, 4 = another backup is already running, 5 = stopped, 6 = failed.
@@ -90,6 +103,7 @@ See `config.example.json`. Your existing file works as it is. New settings are o
 | `mirror_safety_limit_percent` | 10 | Never delete more than this share of the backup in one run without approval |
 | `parallel_uploads` | 4 | Files uploaded at the same time (1–8) |
 | `window_close_seconds` | 30 | How long the pop-up window stays open after a run |
+| `cooldown_hours` | 4 | After a backup finishes, the automatic check waits this long (0 = no pause) |
 | `dry_run` | false | Same as `--dry-run`. While it is `true`, the background check does nothing |
 
 `delete_remote_files` from the old version is no longer used.
@@ -117,6 +131,8 @@ See `config.example.json`. Your existing file works as it is. New settings are o
 - **On battery the laptop went to sleep mid-backup**: many laptops still sleep a few minutes after
   the screen turns off on battery, whatever a program asks. The backup continues on the next run.
   Large uploads resume where they stopped. Plug in for big first uploads.
+- **"OneDrive asked us to slow down"**: this is normal. Microsoft limits how many requests an app
+  may make per minute, and the script waits as asked and carries on. Details are in `backup.log`.
 - **The ETA says "estimating…"**: the script only shows a finish time once its speed
   measurements support it. For example, after many small files it can't yet know how long a
   2 GB file will take.

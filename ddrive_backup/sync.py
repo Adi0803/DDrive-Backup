@@ -17,7 +17,7 @@ from .config import Config
 from .graph import (FRAGMENT_SIZE, LARGE_FILE_SIZE, FatalRunError, FileFailed, GraphClient, GraphError,
                     LocalReadError, RemoteFile, RemoteFolder, RunStopped)
 from .names import key_for
-from .progress import Console, Ticker, TransferProgress, fmt_bytes, fmt_duration
+from .progress import Console, Ticker, TransferProgress, fmt_bytes, fmt_duration, n_files
 from .quickxorhash import EMPTY_HASH, QuickXorHash
 from .scan import LocalFile, LocalScan, local_path, scan_local
 from .state import State
@@ -26,6 +26,7 @@ from .winutils import KeepAwake, describe_os_error, long_path, on_battery
 log = logging.getLogger(__name__)
 
 FAILURE_QUIET_SECONDS = 24 * 3600   # something that failed is retried by the 10-minute check after this
+REMOTE_CHECK_SECONDS = 24 * 3600    # the background check looks at OneDrive itself at least this often
 WIFI_RECHECK_SECONDS = 60
 
 
@@ -205,26 +206,94 @@ class BackupRun:
         self.root_id = root["id"] if root else ""
         if self.state.bind(drive["id"], self.root_id or "(not created yet)"):
             log.info("The OneDrive backup folder changed since the last run; its saved record was reset.")
+        self.state.data["target"] = self.target()
 
         say(f"Scanning {cfg.source_folder} ...")
-        scan_note = (lambda n: self.console.show([f"  {n:,} files found"])) if show_progress else None
+        scan_note = (lambda n: self.console.show([f"  {n_files(n)} found"])) if show_progress else None
         self.local = scan_local(cfg.source_folder, len(cfg.onedrive_folder), scan_note, self.stopper.check)
         if "./" in self.local.unreadable:
             raise FatalRunError("The folder to back up could not be read: " + self.local.unreadable["./"])
         self.console.end_block()
-        say(f"  {len(self.local.files):,} files, {fmt_bytes(self.local.total_bytes)}")
+        say(f"  {n_files(len(self.local.files))}, {fmt_bytes(self.local.total_bytes)}")
 
         if self.root_id:
             say(f"Reading OneDrive/{cfg.onedrive_folder} ...")
-            list_note = (lambda f, d: self.console.show([f"  {f:,} files in {d:,} folders"])) if show_progress else None
-            self.remote_folders, self.remote_files = self.graph.list_tree(self.root_id, list_note)
+            counts = [0, 0]
+
+            def note(files: int, folders: int) -> None:
+                counts[0], counts[1] = files, folders
+
+            def show() -> None:
+                extra = ("   (OneDrive asked us to slow down - waiting a moment, this is normal)"
+                         if self.graph.throttled() else "")
+                self.console.show([f"  {n_files(counts[0])} in {counts[1]:,} folders{extra}"])
+
+            if show_progress:
+                with Ticker(show):
+                    self.remote_folders, self.remote_files = self.graph.list_tree(self.root_id, note)
+            else:
+                self.remote_folders, self.remote_files = self.graph.list_tree(self.root_id)
             self.console.end_block()
-            say(f"  {len(self.remote_files):,} files already in OneDrive")
+            say(f"  {n_files(len(self.remote_files))} already in OneDrive")
+            self.state.mark_remote_checked()
         else:
             self.remote_folders, self.remote_files = {"": RemoteFolder("", "")}, {}
         self.remote_bytes = sum(f.size for f in self.remote_files.values())
         self._folder_ids = {k: f.id for k, f in self.remote_folders.items()}
         return make_plan(self.local, self.remote_folders, self.remote_files, self.state)
+
+    def target(self) -> str:
+        return f"{self.cfg.source_folder}|{self.cfg.onedrive_folder}"
+
+    def needs_remote_check(self) -> bool:
+        """Can the background check rely on the record of the last backup, or
+        must it look at OneDrive itself (no record yet, settings changed, or the
+        last look at OneDrive is older than REMOTE_CHECK_SECONDS)?"""
+        state, now = self.state, time.time()
+        last = state.last_remote_check
+        return (not state.data.get("drive_id") or state.recorded_folders() is None
+                or state.data.get("target") != self.target()
+                or not last or now - last > REMOTE_CHECK_SECONDS or last > now + 300)
+
+    def local_changes(self) -> str | None:
+        """Compare the local folder with the record of the last backup without
+        contacting OneDrive. Returns why a backup is needed, or None."""
+        state, cfg = self.state, self.cfg
+        if not os.path.isdir(self.base):
+            raise FatalRunError(f"The folder to back up does not exist or is not reachable: {cfg.source_folder}")
+        self.local = local = scan_local(cfg.source_folder, len(cfg.onedrive_folder), None, self.stopper.check)
+        if "./" in local.unreadable:
+            raise FatalRunError("The folder to back up could not be read: " + local.unreadable["./"])
+        records = state.data["files"]
+        changed = []
+        for key, lf in local.files.items():
+            record = records.get(key)
+            if record and record[0] == lf.size and record[1] == lf.mtime_ns:
+                continue
+            if state.recent_failure(key, lf.size, lf.mtime_ns, FAILURE_QUIET_SECONDS):
+                continue
+            changed.append(lf.path)
+        recorded = state.recorded_folders() or set()
+        new_folders = [rel for key, rel in local.folders.items() if key not in recorded
+                       and not state.recent_other_failure("folder:" + key, FAILURE_QUIET_SECONDS)]
+        gone = [key for key in records if key not in local.files]
+        gone_folders = [key for key in recorded if key not in local.folders]
+        if changed or new_folders:
+            return (f"{len(changed):,} new/changed {'file' if len(changed) == 1 else 'files'} and "
+                    f"{len(new_folders):,} new {'folder' if len(new_folders) == 1 else 'folders'} on D:")
+        if gone or gone_folders:
+            notice = state.data.get("deletion_notice") or {}
+            if notice.get("at", 0) > time.time() - FAILURE_QUIET_SECONDS:
+                return None      # already held back by the safety stop recently
+            return (f"{n_files(len(gone))} and {len(gone_folders):,} "
+                    f"{'folder' if len(gone_folders) == 1 else 'folders'} deleted on D:")
+        return None
+
+    def record_folders_baseline(self) -> None:
+        """Remember the local folders as backed up (after a run or a check that
+        found everything in sync)."""
+        failed = {key_for(p.rstrip("/")) for p in self.result.failed if p.endswith("/")}
+        self.state.set_folders(k for k in self.local.folders if k not in failed)
 
     def has_work_for_scheduler(self, plan: Plan) -> bool:
         """Should the 10-minute check open a window? Leave out things that failed
@@ -343,6 +412,8 @@ class BackupRun:
                                                [i for i in rest if isinstance(i, RemoteFile)], self.remote_files))
 
         self.state.prune_files(set(local.files))
+        if not self.stopper.stopped:
+            self.record_folders_baseline()
         if not mirroring and plan.deletions:
             self._report_pending_deletions(plan.deletions)
         if not res.failed and not self.stopper.stopped and not self.state.first_complete_backup:
@@ -363,7 +434,7 @@ class BackupRun:
         res.deletions_blocked = deletions.file_count
         self.state.data["deletion_notice"] = {"count": deletions.file_count, "at": time.time()}
         self.console.say(
-            f"\nNOT deleting {deletions.file_count:,} files ({fmt_bytes(deletions.byte_count)}) from OneDrive: "
+            f"\nNOT deleting {n_files(deletions.file_count)} ({fmt_bytes(deletions.byte_count)}) from OneDrive: "
             f"that is more than {cfg.mirror_safety_limit_percent:g}% of the backup. The list is in backup.log.\n"
             f"If you really removed them from {cfg.source_folder}, run this once in cmd:\n"
             f"  {res.approve_command}\n")
@@ -381,7 +452,7 @@ class BackupRun:
         if self.cfg.mirror_deletions == "off":
             return
         self.console.say(
-            f"\n{pending.file_count:,} files ({fmt_bytes(pending.byte_count)}) are in OneDrive but no longer in "
+            f"\n{n_files(pending.file_count)} ({fmt_bytes(pending.byte_count)}) are in OneDrive but no longer in "
             f"{self.cfg.source_folder}. Once mirroring is on (after the first complete backup) they will be "
             "moved to the OneDrive recycle bin. The list is in backup.log.")
 
@@ -413,7 +484,7 @@ class BackupRun:
     def _check_phase(self, plan: Plan) -> None:
         items = plan.to_check
         total = sum(lf.size for lf, _ in items)
-        self.console.say(f"\nChecking {len(items):,} files that are already in OneDrive "
+        self.console.say(f"\nChecking {n_files(len(items))} that are already in OneDrive "
                          f"({fmt_bytes(total)}). This reads them from {self.cfg.source_folder} once.")
         progress = TransferProgress(total, len(items))
         heading = "D-Drive Backup - comparing local files with the copies in OneDrive"
@@ -468,12 +539,12 @@ class BackupRun:
     def _upload_phase(self, items: list[tuple[LocalFile, str]]) -> None:
         total = sum(lf.size for lf, _ in items)
         say = self.console.say
-        say(f"\nUploading {len(items):,} new/changed files ({fmt_bytes(total)}) "
+        say(f"\nUploading {len(items):,} new/changed {'file' if len(items) == 1 else 'files'} ({fmt_bytes(total)}) "
             f"to OneDrive/{self.cfg.onedrive_folder}")
         for lf, reason in items:
             log.info("To upload (%s): %s", reason, lf.path)
         progress = TransferProgress(total, len(items))
-        heading = f"D-Drive Backup - uploading {len(items):,} new/changed files"
+        heading = f"D-Drive Backup - uploading {len(items):,} new/changed {'file' if len(items) == 1 else 'files'}"
         # One worker prefers big files, the others take small ones. That keeps the
         # network busy while small files wait on per-file overhead, and keeps the
         # mix steady so the ETA stays meaningful.
@@ -608,7 +679,7 @@ class BackupRun:
             self.console.say(f"Replacing {len(deletions.items()):,} OneDrive items that are now a "
                              "different type (file <-> folder) locally (old ones go to the recycle bin)...")
         else:
-            self.console.say(f"Removing {deletions.file_count:,} files that you deleted locally from OneDrive "
+            self.console.say(f"Removing {n_files(deletions.file_count)} that you deleted locally from OneDrive "
                              "(they go to the OneDrive recycle bin)...")
         for item in deletions.items():
             self.stopper.check()
@@ -647,8 +718,8 @@ class BackupRun:
         say = self.console.say
         say("\nDRY RUN - nothing will be changed.")
         say(f"  Up to date:        {plan.up_to_date:,}")
-        say(f"  Would compare:     {len(plan.to_check):,} files by checksum")
-        say(f"  Would upload:      {len(plan.to_upload):,} files "
+        say(f"  Would compare:     {n_files(len(plan.to_check))} by checksum")
+        say(f"  Would upload:      {n_files(len(plan.to_upload))} "
             f"({fmt_bytes(sum(lf.size for lf, _ in plan.to_upload))})")
         say(f"  Folders to create: {len(plan.folders_missing):,}")
         if plan.conflicts:
@@ -656,11 +727,11 @@ class BackupRun:
                 "type (file <-> folder) locally")
         gone = plan.deletions
         if mirroring:
-            say(f"  Would delete:      {gone.file_count:,} files ({fmt_bytes(gone.byte_count)}) from OneDrive")
+            say(f"  Would delete:      {n_files(gone.file_count)} ({fmt_bytes(gone.byte_count)}) from OneDrive")
         else:
             when = ("never: mirroring is off" if self.cfg.mirror_deletions == "off"
                     else "they will be deleted once mirroring is on (after the first complete backup)")
-            say(f"  In OneDrive but not in the local folder: {gone.file_count:,} files "
+            say(f"  In OneDrive but not in the local folder: {n_files(gone.file_count)} "
                 f"({fmt_bytes(gone.byte_count)}); {when}")
         wanted = build_deletions(plan.conflicts.folders + (gone.folders if mirroring else []),
                                  plan.conflicts.files + (gone.files if mirroring else []), self.remote_files)
@@ -724,21 +795,21 @@ def summary_lines(res: RunResult, cfg: Config) -> list[str]:
              "dry_run": "Dry run finished - nothing was changed"}[res.status]
     lines = ["", "=" * 70, title + (f": {res.message}" if res.message else ""), "=" * 70]
     if res.local_files:
-        lines.append(f"Local folder:        {res.local_files:,} files, {fmt_bytes(res.local_bytes)}")
+        lines.append(f"Local folder:        {n_files(res.local_files)}, {fmt_bytes(res.local_bytes)}")
     lines.append(f"Already up to date:  {res.up_to_date:,}")
     if res.status != "dry_run":
-        lines.append(f"Uploaded:            {res.uploaded:,} files ({fmt_bytes(res.uploaded_bytes)})")
+        lines.append(f"Uploaded:            {n_files(res.uploaded)} ({fmt_bytes(res.uploaded_bytes)})")
     if res.folders_created:
         lines.append(f"Folders created:     {res.folders_created:,}")
     if res.deleted_files:
-        lines.append(f"Removed from OneDrive: {res.deleted_files:,} files (in the OneDrive recycle bin)")
+        lines.append(f"Removed from OneDrive: {n_files(res.deleted_files)} (in the OneDrive recycle bin)")
     if res.held_back:
         lines.append(f"Kept in OneDrive until their moved copy uploads: {res.held_back:,}")
     if res.pending_deletions and cfg.mirror_deletions != "off":
-        lines.append(f"In OneDrive but no longer local: {res.pending_deletions:,} files "
+        lines.append(f"In OneDrive but no longer local: {n_files(res.pending_deletions)} "
                      "(removed once mirroring is on)")
     if res.deletions_blocked:
-        lines.append(f"Deletions held back by the safety limit: {res.deletions_blocked:,} files. To allow them:")
+        lines.append(f"Deletions held back by the safety limit: {n_files(res.deletions_blocked)}. To allow them:")
         lines.append(f"   {res.approve_command}")
     for label, items in (("Could not read (skipped)", res.unreadable), ("Not allowed by OneDrive", res.not_allowed),
                          ("Failed", res.failed)):

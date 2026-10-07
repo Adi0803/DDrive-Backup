@@ -31,7 +31,8 @@ class State:
     def _fresh() -> dict:
         return {"version": STATE_VERSION, "drive_id": None, "root_id": None,
                 "first_complete_backup": None, "files": {}, "sessions": {}, "failures": {},
-                "other_failures": {}}
+                "other_failures": {}, "folders": None, "last_backup_finished": None,
+                "last_remote_check": None}
 
     def load(self) -> None:
         if not self.path.exists():
@@ -156,6 +157,36 @@ class State:
     def mark_first_complete(self) -> None:
         with self._lock:
             self.data["first_complete_backup"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            self._dirty = True
+
+    @property
+    def last_backup_finished(self) -> float | None:
+        """When the last backup run finished (seconds since 1970, UTC)."""
+        return self.data.get("last_backup_finished")
+
+    def mark_backup_finished(self, when: float | None = None) -> None:
+        with self._lock:
+            self.data["last_backup_finished"] = time.time() if when is None else when
+            self._dirty = True
+
+    @property
+    def last_remote_check(self) -> float | None:
+        return self.data.get("last_remote_check")
+
+    def mark_remote_checked(self) -> None:
+        with self._lock:
+            self.data["last_remote_check"] = time.time()
+            self._dirty = True
+
+    def recorded_folders(self) -> set[str] | None:
+        """Folder keys that existed (and were backed up) after the last complete
+        run, or None if unknown."""
+        folders = self.data.get("folders")
+        return None if folders is None else set(folders)
+
+    def set_folders(self, keys) -> None:
+        with self._lock:
+            self.data["folders"] = sorted(keys)
             self._dirty = True
 
     # --- saving -------------------------------------------------------------

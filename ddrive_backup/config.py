@@ -34,6 +34,7 @@ class Config:
     parallel_uploads: int = 4
     dry_run: bool = False
     window_close_seconds: int = 30
+    cooldown_hours: float = 4.0           # after a backup finishes, the background check waits this long
 
     @property
     def any_network(self) -> bool:
@@ -107,4 +108,5 @@ def load_config(path: Path) -> Config:
         parallel_uploads=number("parallel_uploads", 4, 1, 8),
         dry_run=dry_run,
         window_close_seconds=number("window_close_seconds", 30, 0, 3600),
+        cooldown_hours=number("cooldown_hours", 4, 0, 168, float),
     )

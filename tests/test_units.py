@@ -215,3 +215,39 @@ def test_eta_is_hidden_until_stable_and_then_reasonable(seed):
     errors.sort()
     median = errors[len(errors) // 2]
     assert median < 0.25, f"median ETA error {median:.0%}"
+
+
+def test_task_xml_has_all_triggers_and_is_well_formed(monkeypatch):
+    import xml.etree.ElementTree as ET
+    from ddrive_backup import schedule
+    monkeypatch.setenv("USERDOMAIN", "CORP&CO")
+    xml = schedule.task_xml(r"C:\DDrive <Backup>\DDriveOneDriveBackup.py", r"C:\DDrive <Backup>", 10,
+                            r"D:\OneDrive Backup & Co")
+    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+    root = ET.fromstring(xml.split("?>", 1)[1])
+    triggers = root.find("t:Triggers", ns)
+    names = [child.tag.split("}")[1] for child in triggers]
+    assert names == ["LogonTrigger", "EventTrigger", "TimeTrigger"]
+    logon = triggers.find("t:LogonTrigger", ns)
+    assert logon.find("t:UserId", ns).text.startswith("CORP&CO\\")
+    assert logon.find("t:Delay", ns).text == "PT1M"
+    query = ET.fromstring(triggers.find("t:EventTrigger/t:Subscription", ns).text)
+    select = query.find("Query/Select")
+    assert select.get("Path") == "Microsoft-Windows-NetworkProfile/Operational"
+    assert "EventID=10000" in select.text
+    assert triggers.find("t:TimeTrigger/t:Repetition/t:Interval", ns).text == "PT10M"
+    action = root.find("t:Actions/t:Exec", ns)
+    assert action.find("t:Arguments", ns).text.endswith('DDriveOneDriveBackup.py" --scheduled')
+    settings = root.find("t:Settings", ns)
+    assert settings.find("t:MultipleInstancesPolicy", ns).text == "IgnoreNew"
+    assert settings.find("t:DisallowStartIfOnBatteries", ns).text == "false"
+
+
+def test_bat_files_use_crlf_and_find_the_venv():
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    for name in ("Install autostart.bat", "Remove autostart.bat", "Back up now.bat"):
+        data = (root / name).read_bytes()
+        assert b"\r\n" in data and b"\n" not in data.replace(b"\r\n", b""), name
+        text = data.decode("ascii")
+        assert 'cd /d "%~dp0"' in text and ".venv\\Scripts\\python.exe" in text

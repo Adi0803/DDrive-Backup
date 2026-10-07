@@ -21,7 +21,7 @@ from .progress import Console
 from .state import State
 from .sync import BackupRun, summary_lines
 from .winutils import (SingleInstanceLock, console_python, current_wifi_ssids, open_in_new_window,
-                       set_console_title, wait_or_keypress)
+                       set_console_title, unblock_downloaded_files, wait_or_keypress)
 
 log = logging.getLogger("ddrive_backup")
 
@@ -209,6 +209,7 @@ def main(argv=None, *, script_path: str, tokens_factory=default_tokens, ssid_fn:
     console = Console(enabled=not hidden)
     setup_logging(base / "backup.log", None if hidden else console)
     command = run_command(base, script)
+    unblock_downloaded_files(base)
 
     if args.install_schedule or args.remove_schedule:
         return manage_schedule(args, base, script, console, command)
@@ -294,6 +295,13 @@ def scheduled_check(cfg: Config, base: Path, tokens_factory, ssid_fn: SsidFn):
     if cfg.dry_run:
         log.info("Scheduled check: \"dry_run\" is true in config.json, so the background check does nothing.")
         return EXIT_OK
+    state = State(base / "backup_state.json")
+    state.load()
+    remaining = cooldown_remaining(cfg, state)
+    if remaining > 0:
+        log.info("Scheduled check: last backup finished less than %g hours ago; next check after %s.",
+                 cfg.cooldown_hours, time.strftime("%H:%M", time.localtime(time.time() + remaining)))
+        return EXIT_OK
     ssids, details = ssid_fn() if not cfg.any_network else ([], "")
     on_office, why = office_wifi_status(cfg, False, lambda: (ssids, details))
     if not on_office:
@@ -311,16 +319,25 @@ def scheduled_check(cfg: Config, base: Path, tokens_factory, ssid_fn: SsidFn):
         tokens = tokens_factory(cfg, base, False, lambda text: None)
         stopper = Stopper()
         graph = GraphClient(tokens, stopper, wifi_problem_checker(cfg, False, ssid_fn))
-        state = State(base / "backup_state.json")
-        state.load()
         run = BackupRun(cfg, graph, state, Console(False), wifi_problem_checker(cfg, False, ssid_fn))
+        if not run.needs_remote_check():
+            # Compare D: with the record of the last backup; no OneDrive requests.
+            reason = run.local_changes()
+            notice.clear()
+            if reason is None:
+                log.info("Scheduled check: nothing changed in %s since the last backup.", cfg.source_folder)
+                return EXIT_OK
+            log.info("Scheduled check: %s; opening the backup window.", reason)
+            return _OPEN_WINDOW
         tokens.get()
         plan = run.prepare(show_progress=False)
-        state.save()
         notice.clear()
         if not run.has_work_for_scheduler(plan):
-            log.info("Scheduled check: everything is backed up (%d files).", len(run.local.files))
+            run.record_folders_baseline()        # D: and OneDrive are in sync: remember this state
+            state.save()
+            log.info("Scheduled check: checked OneDrive; everything is backed up (%d files).", len(run.local.files))
             return EXIT_OK
+        state.save()
         reason = (f"{len(plan.to_upload)} to upload, {len(plan.to_check)} to compare, "
                   f"{len(plan.folders_missing)} folders to create, {plan.deletions.file_count} deleted locally")
         log.info("Scheduled check: %s; opening the backup window.", reason)
@@ -350,6 +367,17 @@ def scheduled_check(cfg: Config, base: Path, tokens_factory, ssid_fn: SsidFn):
     if notice.should_show(kind, message):
         return _OPEN_WINDOW
     return EXIT_OK
+
+
+def cooldown_remaining(cfg: Config, state: State, now: float | None = None) -> float:
+    """Seconds until the background check may run again after the last finished
+    backup (0 = may run now). Based on the stored finish time, so it survives
+    restarts; a finish time in the future (clock was set back) is ignored."""
+    now = time.time() if now is None else now
+    last = state.last_backup_finished
+    if not last or cfg.cooldown_hours <= 0 or last > now + 300:
+        return 0.0
+    return max(0.0, last + cfg.cooldown_hours * 3600 - now)
 
 
 def _launch_if_no_window(base: Path, why: str):
@@ -394,11 +422,22 @@ def run_backup(cfg: Config, args, base: Path, console: Console, command: str, to
     run = BackupRun(cfg, graph, state, console, wifi_problem, approve_deletions=args.approve_deletions,
                     command=command)
     result = run.run()
+    next_check = None
+    if result.status in ("complete", "finished_with_problems") and not cfg.dry_run:
+        state.mark_backup_finished()          # starts the cooldown of the background check
+        state.save()
+        if cfg.cooldown_hours > 0:
+            next_check = time.strftime("%H:%M", time.localtime(time.time() + cfg.cooldown_hours * 3600))
     for line in summary_lines(result, cfg):
         console.say(line)
         for part in line.splitlines():
             if part.strip():
                 log.info("%s", part)
+    if next_check:
+        message = (f"Automatic checks pause until {next_check} ({cfg.cooldown_hours:g} hours after this backup). "
+                   "To back up sooner, double-click \"Back up now.bat\".")
+        console.say(message)
+        log.info("%s", message)
     titles = {"complete": "done", "dry_run": "dry run done", "finished_with_problems": "done, with problems",
               "stopped": "stopped", "failed": "failed"}
     set_console_title(f"D-Drive Backup - {titles[result.status]}")
@@ -409,13 +448,21 @@ def manage_schedule(args, base: Path, script: Path, console: Console, command: s
     try:
         if args.remove_schedule:
             schedule.remove()
-            console.say(f"Removed the scheduled task \"{schedule.TASK_NAME}\".")
+            console.say(f"Removed the scheduled task \"{schedule.TASK_NAME}\". The backup no longer starts "
+                        "by itself.")
             return EXIT_OK
         cfg = load_config(base / "config.json")
         schedule.install(str(script), str(base), cfg.scan_interval_minutes, cfg.source_folder)
-        console.say(f"Installed the scheduled task \"{schedule.TASK_NAME}\": every {cfg.scan_interval_minutes} "
-                    f"minutes it checks for the office Wi-Fi and opens the backup window when something changed.")
-        console.say(f"To remove it later:  {command} --remove-schedule")
+        schedule.run_now()
+        console.say(f"Autostart is on (scheduled task \"{schedule.TASK_NAME}\"). From now on the backup check "
+                    "starts by itself:")
+        console.say("  - about 1 minute after you sign in to Windows,")
+        console.say("  - about 30 seconds after the PC connects to a network (Wi-Fi or cable),")
+        console.say(f"  - and every {cfg.scan_interval_minutes} minutes.")
+        console.say("It only backs up on the office Wi-Fi, and a window opens only when there is something to do.")
+        console.say("This stays on after restarts; you never need to start it yourself.")
+        console.say("To turn it off: double-click \"Remove autostart.bat\" "
+                    f"(or run: {command} --remove-schedule).")
         return EXIT_OK
     except (ConfigError, RuntimeError, OSError) as exc:
         console.say(f"Could not change the schedule: {exc}")

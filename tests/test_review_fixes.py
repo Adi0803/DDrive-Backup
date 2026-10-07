@@ -348,3 +348,107 @@ def test_no_stale_progress_block_after_a_stop(env, monkeypatch, capsys):
     assert env.run("--window") == app.EXIT_STOPPED
     out = capsys.readouterr().out
     assert "comparing local files" not in out[out.index("Backup stopped"):]
+
+
+# --- 4-hour pause after a backup, quiet local check, throttling ----------------------------
+
+def _graph_requests(env):
+    return [r for r in env.mock.requests_log if not r["path"].startswith("/upload/")]
+
+
+def test_cooldown_after_a_backup(env):
+    env.config(cooldown_hours=4)
+    sample_tree(env)
+    assert env.run() == app.EXIT_OK                        # manual backup starts the pause
+    env.write("Projects/new.txt", b"new")
+    mark = len(env.mock.requests_log)
+    assert env.run("--scheduled") == app.EXIT_OK
+    assert env.windows == []                                # paused: nothing happens at all
+    assert len(env.mock.requests_log) == mark               # not even a OneDrive request
+    assert "next check after" in env.log_text()
+    state_file = env.base / "backup_state.json"             # pretend the backup was 5 hours ago
+    state = json.loads(state_file.read_text())
+    state["last_backup_finished"] -= 5 * 3600
+    state_file.write_text(json.dumps(state))
+    assert env.run("--scheduled") == app.EXIT_OK
+    assert len(env.windows) == 1
+
+
+def test_cooldown_ignores_a_finish_time_in_the_future(env):
+    env.config(cooldown_hours=4)
+    sample_tree(env)
+    assert env.run() == app.EXIT_OK
+    state_file = env.base / "backup_state.json"
+    state = json.loads(state_file.read_text())
+    state["last_backup_finished"] += 3 * 24 * 3600          # clock was set back since then
+    state_file.write_text(json.dumps(state))
+    env.write("Projects/new.txt", b"new")
+    assert env.run("--scheduled") == app.EXIT_OK
+    assert len(env.windows) == 1
+
+
+def test_back_up_now_ignores_the_pause(env):
+    env.config(cooldown_hours=4)
+    sample_tree(env)
+    assert env.run() == app.EXIT_OK
+    env.write("Projects/new.txt", b"new")
+    assert env.run() == app.EXIT_OK                         # what "Back up now.bat" runs
+    assert "Projects/new.txt" in env.remote()
+
+
+def test_background_check_needs_no_onedrive_requests_when_nothing_changed(env):
+    sample_tree(env)
+    assert env.run() == app.EXIT_OK
+    mark = len(env.mock.requests_log)
+    assert env.run("--scheduled") == app.EXIT_OK
+    assert env.windows == [] and len(env.mock.requests_log) == mark
+    env.write("Projects/new.txt", b"new")                    # a change on D: is noticed locally
+    (env.src / "space name.txt").unlink()
+    assert env.run("--scheduled") == app.EXIT_OK
+    assert len(env.windows) == 1 and len(env.mock.requests_log) == mark
+
+
+def test_background_check_looks_at_onedrive_once_a_day(env):
+    sample_tree(env)
+    assert env.run() == app.EXIT_OK
+    env.mock.add_file(f"{ROOT}/added-in-onedrive.txt", b"x")    # changed directly in OneDrive
+    assert env.run("--scheduled") == app.EXIT_OK
+    assert env.windows == []                                 # not noticed by the quick check ...
+    state_file = env.base / "backup_state.json"
+    state = json.loads(state_file.read_text())
+    state["last_remote_check"] -= 25 * 3600
+    state_file.write_text(json.dumps(state))
+    assert env.run("--scheduled") == app.EXIT_OK
+    assert len(env.windows) == 1                             # ... but by the daily OneDrive check
+
+
+def test_daily_check_in_sync_records_baseline_without_window(env):
+    sample_tree(env)
+    assert env.run() == app.EXIT_OK
+    state_file = env.base / "backup_state.json"
+    state = json.loads(state_file.read_text())
+    state["last_remote_check"] -= 25 * 3600
+    state["folders"] = None                                  # e.g. state from the previous version
+    state_file.write_text(json.dumps(state))
+    assert env.run("--scheduled") == app.EXIT_OK
+    assert env.windows == []
+    state = json.loads(state_file.read_text())
+    assert state["folders"] and state["last_remote_check"] > time.time() - 60
+
+
+def test_changed_settings_force_a_onedrive_check(env):
+    sample_tree(env)
+    assert env.run() == app.EXIT_OK
+    env.config(onedrive_folder="Other-Backup")
+    assert env.run("--scheduled") == app.EXIT_OK
+    assert len(env.windows) == 1
+
+
+def test_throttling_is_waited_out_quietly(env, capsys):
+    sample_tree(env)
+    env.mock.fail_next("GET", r"/children", 429, count=30, headers={"Retry-After": "1"})
+    assert env.run() == app.EXIT_OK
+    out = capsys.readouterr().out
+    assert "HTTP 429" not in out
+    assert "slow down" in env.log_text()
+    assert env.remote() == env.local()

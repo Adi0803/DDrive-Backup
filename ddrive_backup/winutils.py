@@ -278,3 +278,16 @@ def wait_or_keypress(seconds: int | None) -> None:
             pass
     else:
         time.sleep(max(0, seconds))
+
+
+def unblock_downloaded_files(folder: Path) -> None:
+    """Files extracted from a downloaded ZIP carry a "came from the internet"
+    mark, which makes Windows show a security warning every time a .bat file
+    is double-clicked. Remove that mark from our own .bat files."""
+    if not IS_WINDOWS:
+        return
+    for bat in Path(folder).glob("*.bat"):
+        try:
+            os.remove(str(bat) + ":Zone.Identifier")
+        except OSError:
+            pass

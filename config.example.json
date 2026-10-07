@@ -7,6 +7,7 @@
 
     "office_wifi_ssid": "Horizon 5G",
     "scan_interval_minutes": 10,
+    "cooldown_hours": 4,
 
     "mirror_deletions": "auto",
     "mirror_safety_limit_percent": 10,

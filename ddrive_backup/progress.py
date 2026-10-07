@@ -22,6 +22,10 @@ def fmt_bytes(n: float) -> str:
     return f"{n / 1000:,.0f} KB"
 
 
+def n_files(n: int) -> str:
+    return f"{n:,} file" + ("" if n == 1 else "s")
+
+
 def fmt_duration(seconds: float) -> str:
     seconds = int(max(0, seconds))
     return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"

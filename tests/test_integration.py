@@ -64,7 +64,7 @@ class Env:
     def config(self, **over):
         data = {"client_id": "c", "tenant_id": "t", "source_folder": str(self.src), "onedrive_folder": ROOT,
                 "office_wifi_ssid": "Horizon 5G", "scan_interval_minutes": 10, "parallel_uploads": 3,
-                "window_close_seconds": 0}
+                "window_close_seconds": 0, "cooldown_hours": 0}
         data.update(over)
         (self.base / "config.json").write_text(json.dumps(data))
 
